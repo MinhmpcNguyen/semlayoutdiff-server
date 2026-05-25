@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
@@ -225,38 +226,62 @@ def load_catalog_index(settings: CatalogClientSettings | None = None) -> Catalog
 
 # ── Type inference ────────────────────────────────────────────────────────────
 
+# Keywords are in ASCII-normalized form (no Vietnamese diacritics).
+# Listed from most-specific to least-specific so the first match wins.
 _KEYWORD_TYPE_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("bed", ("bed", "giuong")),
-    ("nightstand", ("nightstand", "bedside", "tu_dau_giuong", "tu_canh_giuong")),
-    ("wardrobe", ("wardrobe", "closet", "tu_quan_ao", "tu_ao")),
-    ("bookshelf", ("bookshelf", "bookcase", "shelf", "ke_sach")),
-    ("desk", ("desk", "ban_lam_viec")),
-    ("dresser", ("dresser", "dressing", "chest_of_drawers", "tu_ngan_keo")),
-    ("dining_table", ("dining_table", "ban_an")),
-    ("coffee_table", ("coffee_table", "ban_tra", "ban_cafe")),
-    ("tv_console", ("tv_console", "tv_stand", "media_console", "ke_tv", "ke_tivi")),
-    ("side_table", ("side_table", "end_table", "ban_phu")),
-    ("stool", ("stool", "ghe_don")),
-    ("armchair", ("armchair", "lounge_chair", "ghe_sofa_don")),
-    ("sofa", ("sofa", "couch", "loveseat", "ghe_sofa")),
-    ("chair", ("chair", "ghe_tua", "dining_chair")),
-    ("cabinet", ("cabinet", "tu_tru", "wine_cabinet")),
-    ("ceiling_light", ("ceiling_lamp", "pendant_lamp", "den_tran", "den_tha")),
+    # Nightstands first — name contains "giuong" but must NOT be classified as bed
+    ("nightstand",   ("tu_dau_giuong", "tu_canh_giuong", "nightstand", "bedside")),
+    # Beds
+    ("bed",          ("giuong_forest", "giuong_rustic", "giuong_ngu", "giuong",
+                      "bed", "double_bed", "single_bed")),
+    # Wardrobe
+    ("wardrobe",     ("tu_quan_ao", "wardrobe", "closet")),
+    # Desk (before generic table keywords)
+    ("desk",         ("ban_lam_viec", "ban_go_lam_viec", "desk")),
+    # TV console
+    ("tv_console",   ("ke_tv", "ke_tivi", "tv_stand", "media_console", "tv_console")),
+    # Dining table
+    ("dining_table", ("ban_an", "dining_table")),
+    # Coffee table
+    ("coffee_table", ("ban_tra", "coffee_table", "ban_cafe")),
+    # Side table
+    ("side_table",   ("ban_phu", "side_table", "end_table")),
+    # Dresser
+    ("dresser",      ("tu_ngan_keo", "dresser", "dressing")),
+    # Bookshelf – catalog has "kệ gỗ" (ke_go)
+    ("bookshelf",    ("ke_go", "ke_sach", "bookshelf", "bookcase", "shelf")),
+    # Cabinet – catalog has "tủ gỗ" (tu_go) and "tủ góc" (tu_goc)
+    ("cabinet",      ("tu_go", "tu_goc", "cabinet", "tu_tru")),
+    # Sofa (before generic chair)
+    ("sofa",         ("sofa", "couch", "loveseat", "ghe_sofa")),
+    # Armchair
+    ("armchair",     ("armchair", "lounge_chair", "ghe_sofa_don")),
+    # Stool
+    ("stool",        ("stool", "ghe_don")),
+    # Chair – "ghe_tua" for named chairs; "ghe" as last-resort catch-all
+    ("chair",        ("ghe_tua", "ghe_go", "ghe_forest", "dining_chair", "chair", "ghe")),
+    # Ceiling light – catalog has "đèn trần" (den_tran) and "đèn treo" (den_treo)
+    ("ceiling_light", ("den_tran", "den_treo", "ceiling_lamp", "pendant_lamp", "den_tha")),
 )
+
+
+def _normalize_vn(text: str) -> str:
+    """Strip Vietnamese diacritics and return lowercase ASCII."""
+    # 'đ' (U+0111) has no NFKD decomposition → replace explicitly first
+    text = text.replace("đ", "d").replace("Đ", "d")
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return normalized.lower().replace("-", "_").replace(" ", "_")
 
 
 def _infer_type(item: _CatalogItem) -> str | None:
     if item.object_role:
-        low = item.object_role.lower().replace("-", "_").replace(" ", "_")
+        low = _normalize_vn(item.object_role)
         for inv_type, keywords in _KEYWORD_TYPE_MAP:
             if any(kw in low for kw in keywords):
                 return inv_type
 
-    haystack = " ".join(
-        x.lower()
-        for x in [item.name or "", item.name_vn or ""]
-        if x
-    ).replace("-", "_").replace(" ", "_")
+    raw = " ".join(x for x in [item.name or "", item.name_vn or ""] if x)
+    haystack = _normalize_vn(raw)
 
     for inv_type, keywords in _KEYWORD_TYPE_MAP:
         if any(kw in haystack for kw in keywords):
