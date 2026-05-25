@@ -119,14 +119,14 @@ def polygon_to_floor_plan_tensor(
         dtype=np.int32,
     )
 
-    img = np.zeros((SLDN_IMAGE_SIZE, SLDN_IMAGE_SIZE), dtype=np.int64)
+    img = np.zeros((SLDN_IMAGE_SIZE, SLDN_IMAGE_SIZE), dtype=np.uint8)
     # Note: cv2.fillPoly expects (col, row) ordering for points
     # Our pixel_pts are (row_offset, col_offset) relative to center.
     # SLDN row = 60 + (polygon_x - cx) * scale_px → swap axes for cv2
     pts_cv2 = pixel_pts[:, [1, 0]]  # swap to (col, row) = cv2 (x, y)
     cv2.fillPoly(img, [pts_cv2], 1)
 
-    tensor = torch.tensor(img, dtype=torch.int64).unsqueeze(0).unsqueeze(0)
+    tensor = torch.tensor(img.astype(np.int64), dtype=torch.int64).unsqueeze(0).unsqueeze(0)
     return tensor, (cx, cy), scale_px
 
 
