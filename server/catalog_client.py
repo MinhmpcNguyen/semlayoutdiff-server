@@ -23,41 +23,56 @@ DEFAULT_ASSET_BASE_URL = "https://storage.mazig.io"
 DEFAULT_PAGE_LIMIT = 500
 DEFAULT_TIMEOUT_SECONDS = 20.0
 
-# Maps backend_new APM category names → catalog search type keywords.
-# Multiple APM categories can map to the same catalog type.
+# Maps APM category names → catalog type key.
+# Fallback rules (for types not in catalog):
+#   armchair / lounge_chair → chair  (no standalone armchair in catalog)
+#   coffee_table / side_table / corner_side_table / round_end_table → table (bàn gỗ)
+#   dressing_table / dresser → desk  (no bàn phấn in catalog; desk is closest)
+#   stool → chair                    (no stool in catalog)
 _APM_CATEGORY_TO_CATALOG_TYPE: dict[str, str] = {
+    # Beds
     "kids_bed": "bed",
     "single_bed": "bed",
     "double_bed": "bed",
-    "corner_side_table": "side_table",
-    "round_end_table": "side_table",
-    "coffee_table": "coffee_table",
+    # Tables — generic wooden table (bàn gỗ) used as fallback
+    "coffee_table": "table",
+    "corner_side_table": "table",
+    "round_end_table": "table",
+    "side_table": "table",
+    # TV / console
     "console_table": "tv_console",
     "tv_stand": "tv_console",
+    # Desk / work table
     "desk": "desk",
-    "dressing_table": "dresser",
+    "dressing_table": "desk",   # no bàn phấn in catalog → use desk
+    # Dining
     "table": "dining_table",
     "dining_table": "dining_table",
-    "stool": "stool",
+    # Seating — no armchair/stool in catalog → fall back to chair
+    "stool": "chair",
     "dressing_chair": "chair",
     "dining_chair": "chair",
     "chinese_chair": "chair",
-    "armchair": "armchair",
+    "armchair": "chair",
+    "lounge_chair": "chair",
     "chair": "chair",
-    "lounge_chair": "armchair",
+    # Sofas
     "loveseat_sofa": "sofa",
     "lazy_sofa": "sofa",
     "sofa": "sofa",
     "multi_seat_sofa": "sofa",
     "chaise_longue_sofa": "sofa",
     "l_shaped_sofa": "sofa",
+    # Bedroom storage
     "nightstand": "nightstand",
+    "wardrobe": "wardrobe",
+    # Shelving / storage
     "shelf": "bookshelf",
     "bookshelf": "bookshelf",
     "children_cabinet": "cabinet",
     "wine_cabinet": "cabinet",
     "cabinet": "cabinet",
-    "wardrobe": "wardrobe",
+    # Lighting
     "pendant_lamp": "ceiling_light",
     "ceiling_lamp": "ceiling_light",
 }
@@ -242,12 +257,15 @@ _KEYWORD_TYPE_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tv_console",   ("ke_tv", "ke_tivi", "tv_stand", "media_console", "tv_console")),
     # Dining table
     ("dining_table", ("ban_an", "dining_table")),
-    # Coffee table
+    # Generic table — "bàn gỗ" (ban_go) used for coffee/side/dressing fallback
+    # Excludes ban_bep (kitchen counter, only 3cm tall)
+    ("table",        ("ban_go_forest", "ban_go")),
+    # Coffee table (dedicated, in case catalog adds one later)
     ("coffee_table", ("ban_tra", "coffee_table", "ban_cafe")),
     # Side table
     ("side_table",   ("ban_phu", "side_table", "end_table")),
     # Dresser
-    ("dresser",      ("tu_ngan_keo", "dresser", "dressing")),
+    ("dresser",      ("ban_phan", "tu_ngan_keo", "dresser", "dressing")),
     # Bookshelf – catalog has "kệ gỗ" (ke_go)
     ("bookshelf",    ("ke_go", "ke_sach", "bookshelf", "bookcase", "shelf")),
     # Cabinet – catalog has "tủ gỗ" (tu_go) and "tủ góc" (tu_goc)
