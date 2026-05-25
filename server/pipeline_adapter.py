@@ -24,6 +24,7 @@ from server.domain import (
     PipelineNormalizeRunRotation,
 )
 from server.floor_plan_utils import (
+    _to_meters,
     apm_position_to_world,
     detect_room_type,
     polygon_to_floor_plan_tensor,
@@ -32,6 +33,21 @@ from server.floor_plan_utils import (
 from server.ml_runner import APMRunner, SLDNRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _point_in_polygon(x: float, z: float, polygon: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon test on the X-Z floor plane."""
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, zi = polygon[i]
+        xj, zj = polygon[j]
+        if ((zi > z) != (zj > z)) and (x < (xj - xi) * (z - zi) / (zj - zi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
 
 # Placeholder model URL used when no catalog item is found.
 _FALLBACK_MODEL_URL = "https://storage.mazig.io/models/placeholder.glb"
@@ -79,6 +95,7 @@ class PipelineAdapter:
         floor_plan_tensor, room_center, scale_px = polygon_to_floor_plan_tensor(
             polygons, req.source_unit
         )
+        room_polygon_m = _to_meters(polygons, req.source_unit)
         room_type_id = detect_room_type(req.room.name, req.room.description)
         room_type_str = {0: "bedroom", 1: "livingroom", 2: "diningroom"}.get(
             room_type_id, "livingroom"
@@ -110,7 +127,7 @@ class PipelineAdapter:
         for idx, furniture_list in enumerate(option_furniture_lists):
             option_id = f"option_{idx + 1}"
             objects = self._furniture_to_objects(
-                furniture_list, room_center, scale_px
+                furniture_list, room_center, scale_px, room_polygon_m
             )
             score = len(objects)  # simple score: more furniture = better layout
             coverage = self._coverage_ratio(furniture_list, polygons, req.source_unit)
@@ -172,10 +189,11 @@ class PipelineAdapter:
         furniture_list: list[dict],
         room_center: tuple[float, float],
         scale_px: float,
+        room_polygon_m: list[tuple[float, float]],
     ) -> list[PipelineNormalizeRunObject]:
         objects: list[PipelineNormalizeRunObject] = []
         for item in furniture_list:
-            obj = self._furniture_item_to_object(item, room_center, scale_px)
+            obj = self._furniture_item_to_object(item, room_center, scale_px, room_polygon_m)
             if obj is not None:
                 objects.append(obj)
         return objects
@@ -185,6 +203,7 @@ class PipelineAdapter:
         item: dict,
         room_center: tuple[float, float],
         scale_px: float,
+        room_polygon_m: list[tuple[float, float]],
     ) -> PipelineNormalizeRunObject | None:
         category = item.get("category", "unknown")
         pos_apm = item.get("position_apm", {})
@@ -202,6 +221,14 @@ class PipelineAdapter:
             room_center=room_center,
             scale_px=scale_px,
         )
+        world_y = max(0.0, world_y)  # clamp negative heights to floor
+
+        # Discard items whose centroid falls outside the room polygon
+        if room_polygon_m and not _point_in_polygon(world_x, world_z, room_polygon_m):
+            logger.debug(
+                "Skipping out-of-bounds %r at (%.3f, %.3f)", category, world_x, world_z
+            )
+            return None
 
         # Rotation: degrees → quaternion
         qx, qy, qz, qw = rotation_deg_to_quaternion(rotation_deg)
@@ -254,8 +281,6 @@ class PipelineAdapter:
             return 0.0
 
         # Estimate room area from polygon bounding box
-        from server.floor_plan_utils import _to_meters  # noqa: PLC0415
-
         pts_m = _to_meters(polygons, source_unit)
         xs = [p[0] for p in pts_m]
         ys = [p[1] for p in pts_m]
