@@ -9,8 +9,12 @@ PipelineNormalizeRunResponse, bridging the gaps between:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Sequence
+
+import numpy as np
 
 from server.catalog_client import CatalogEntry, CatalogIndex
 from server.domain import (
@@ -47,6 +51,32 @@ def _point_in_polygon(x: float, z: float, polygon: list[tuple[float, float]]) ->
             inside = not inside
         j = i
     return inside
+
+
+def _save_debug_files(
+    floor_plan: np.ndarray,
+    semantic_maps: list[np.ndarray],
+    room_center: tuple[float, float],
+    scale_px: float,
+) -> None:
+    """Save intermediate SLDN inputs/outputs to SLDN_DEBUG_DIR if the env var is set."""
+    debug_dir = os.environ.get("SLDN_DEBUG_DIR", "").strip()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    np.save(os.path.join(debug_dir, "floor_plan.npy"), floor_plan)
+    for i, sem in enumerate(semantic_maps):
+        np.save(os.path.join(debug_dir, f"semantic_map_{i}.npy"), sem)
+    with open(os.path.join(debug_dir, "meta.json"), "w") as fh:
+        json.dump(
+            {
+                "center": list(room_center),
+                "scale_px": scale_px,
+                "num_options": len(semantic_maps),
+            },
+            fh,
+        )
+    logger.info("Debug files saved to %s (%d semantic maps)", debug_dir, len(semantic_maps))
 
 
 # Placeholder model URL used when no catalog item is found.
@@ -108,6 +138,13 @@ class PipelineAdapter:
             )
         except Exception as exc:
             raise RuntimeError(f"SLDN inference failed: {exc}") from exc
+
+        _save_debug_files(
+            floor_plan_tensor.squeeze().cpu().numpy(),
+            semantic_maps,
+            room_center,
+            scale_px,
+        )
 
         # ── Step 3: APM → furniture attributes (per option) ──────────────────
         option_furniture_lists: list[list[dict]] = []
