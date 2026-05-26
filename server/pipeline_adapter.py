@@ -82,6 +82,11 @@ def _save_debug_files(
 # Placeholder model URL used when no catalog item is found.
 _FALLBACK_MODEL_URL = "https://storage.mazig.io/models/placeholder.glb"
 
+# Categories that hang from the ceiling — their Y position must NOT be zeroed out.
+_CEILING_CATEGORIES: frozenset[str] = frozenset({
+    "ceiling_light", "pendant_lamp", "ceiling_lamp",
+})
+
 # Room area (m²) → coverage_ratio heuristic:
 # assume a good layout covers ~30-50 % of the floor area with furniture.
 _TARGET_COVERAGE_RATIO = 0.40
@@ -258,7 +263,12 @@ class PipelineAdapter:
             room_center=room_center,
             scale_px=scale_px,
         )
-        world_y = max(0.0, world_y)  # clamp negative heights to floor
+        # Fix 1 — Y position: APM offset_pred is very noisy (loss weight=0.01).
+        # Floor items must sit on the floor (Y=0); only ceiling items keep APM's Y.
+        if category in _CEILING_CATEGORIES:
+            world_y = max(0.0, world_y)
+        else:
+            world_y = 0.0
 
         # Discard items whose centroid falls outside the room polygon
         if room_polygon_m and not _point_in_polygon(world_x, world_z, room_polygon_m):
@@ -278,6 +288,31 @@ class PipelineAdapter:
             h = float(size_apm.get("h", 0.5))
             d = float(size_apm.get("d", 1.0))
             size = [w, h, d]
+
+        # Fix 2 — Footprint clamping: centroid may be inside the polygon but the
+        # full furniture footprint (catalog size × rotation) can still overflow the walls.
+        # Compute the axis-aligned bounding box of the rotated footprint and clamp
+        # the centroid so every corner stays within the room bounding box.
+        if room_polygon_m:
+            import math as _math
+            half_w, half_d = size[0] / 2.0, size[2] / 2.0
+            rad = _math.radians(rotation_deg)
+            cos_a, sin_a = abs(_math.cos(rad)), abs(_math.sin(rad))
+            # AABB half-extents of the rotated footprint in world X and Z
+            hx = half_w * cos_a + half_d * sin_a
+            hz = half_w * sin_a + half_d * cos_a
+            # Shrink room bounding box by those half-extents
+            xs = [p[0] for p in room_polygon_m]
+            zs = [p[1] for p in room_polygon_m]
+            lo_x, hi_x = min(xs) + hx, max(xs) - hx
+            lo_z, hi_z = min(zs) + hz, max(zs) - hz
+            if lo_x > hi_x or lo_z > hi_z:
+                logger.debug(
+                    "Room too small for %r (%.2f×%.2fm) — skipping.", category, size[0], size[2]
+                )
+                return None
+            world_x = max(lo_x, min(world_x, hi_x))
+            world_z = max(lo_z, min(world_z, hi_z))
 
         model_url = (
             catalog_entry.model_url if catalog_entry else _FALLBACK_MODEL_URL
