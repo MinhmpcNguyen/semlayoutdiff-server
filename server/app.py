@@ -17,7 +17,7 @@ METADATA_DIR        Path to preprocess/metadata directory
 JOB_STORAGE_DIR     Directory for job state files
                     (default: <backend_new>/server_jobs)
 NUM_OPTIONS         Number of layout options to generate per request (default: 3)
-SLDN_CONDITION_TYPE "floor", "arch", or "uncon" (default: "floor")
+SLDN_CONDITION_TYPE "floor", "arch", or "uncon" (default: "arch")
 """
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     sldn_model_dir = _env("SLDN_MODEL_DIR", "")
     apm_checkpoint = _env("APM_CHECKPOINT", "")
     num_options = int(_env("NUM_OPTIONS", "3"))
-    condition_type = _env("SLDN_CONDITION_TYPE", "floor")
+    condition_type = _env("SLDN_CONDITION_TYPE", "arch")
 
     # Job manager
     repo = NormalizeRunJobRepository(Path(job_storage_dir))

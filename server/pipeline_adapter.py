@@ -132,8 +132,18 @@ class PipelineAdapter:
             raise ValueError("Room polygon must have at least 3 vertices.")
 
         # ── Step 1: Convert polygon → floor plan tensor ───────────────────────
+        # Build opening dicts for arch encoding (door=2, window=3 pixels).
+        # FrontendOpeningPayload stores the full SceneObject JSON in model_extra.
+        opening_dicts: list[dict] = []
+        for op in req.openings:
+            d: dict = {"objectRole": op.objectRole}
+            if op.model_extra:
+                d.update(op.model_extra)
+            opening_dicts.append(d)
+
         floor_plan_tensor, room_center, scale_px = polygon_to_floor_plan_tensor(
-            polygons, req.source_unit
+            polygons, req.source_unit,
+            openings=opening_dicts or None,
         )
         room_polygon_m = _to_meters(polygons, req.source_unit)
         room_type_id = detect_room_type(req.room.name, req.room.description)

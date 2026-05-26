@@ -80,16 +80,30 @@ def detect_room_type(name: str | None, description: str | None) -> int:
 def polygon_to_floor_plan_tensor(
     polygons: Sequence[Sequence[float]],
     source_unit: str = "auto",
+    openings: list[dict] | None = None,
 ) -> tuple[torch.Tensor, tuple[float, float], float]:
     """
-    Convert a 2D room polygon to a 120×120 binary floor plan tensor.
+    Convert a 2D room polygon to a 120×120 floor plan tensor.
+
+    When *openings* is provided the tensor uses the "arch" encoding:
+      0 = background, 1 = floor, 2 = door, 3 = window
+    Without openings it produces a plain binary tensor (0/1).
+
+    Parameters
+    ----------
+    polygons : list of [x, z] points describing the room boundary
+    source_unit : unit of polygon coordinates ("m", "mm", "auto")
+    openings : optional list of dicts, each with keys:
+        "objectRole" : "door" | "window"
+        "position"   : [x, y, z]  (world coords, same unit as polygons)
+        "size"       : [w, h, d]  (world units, optional)
+        "rotation"   : [qx, qy, qz, qw]  (optional)
 
     Returns
     -------
     tensor : torch.Tensor  shape [1, 1, 120, 120], dtype int64
-        1 = floor, 0 = background. Ready to pass to the SLDN model.
-    room_center : (cx, cy)  room centre in metres (polygon coordinate frame)
-    scale_px : float  pixels-per-metre used; needed to invert APM positions
+    room_center : (cx, cy)  room centre in metres
+    scale_px : float  pixels-per-metre
     """
     pts_m = _to_meters(polygons, source_unit)
 
@@ -126,8 +140,62 @@ def polygon_to_floor_plan_tensor(
     pts_cv2 = pixel_pts[:, [1, 0]]  # swap to (col, row) = cv2 (x, y)
     cv2.fillPoly(img, [pts_cv2], 1)
 
+    # Arch encoding: draw door (2) and window (3) pixels on top of the floor
+    if openings:
+        _draw_openings_on_img(img, openings, cx, cy, scale_px)
+
     tensor = torch.tensor(img.astype(np.int64), dtype=torch.int64).unsqueeze(0).unsqueeze(0)
     return tensor, (cx, cy), scale_px
+
+
+def _draw_openings_on_img(
+    img: np.ndarray,
+    openings: list[dict],
+    cx: float,
+    cy: float,
+    scale_px: float,
+) -> None:
+    """
+    Draw door (pixel value 2) and window (pixel value 3) rectangles onto *img*
+    in-place.  Implements the "arch" conditioning encoding used during SLDN
+    training (0=bg, 1=floor, 2=door, 3=window).
+
+    Coordinate mapping (same as polygon rasterization):
+      row = IMAGE_CENTER + (world_x - cx) * scale_px
+      col = IMAGE_CENTER + (world_z - cy) * scale_px
+
+    The rectangle is drawn axis-aligned using the larger of the opening's
+    width/depth as the square side, so thin door meshes still produce a
+    clearly visible marker.  A minimum footprint of 0.8 m is enforced.
+    """
+    for op in openings:
+        pos = op.get("position")
+        if not (isinstance(pos, (list, tuple)) and len(pos) >= 3):
+            continue
+
+        world_x, world_z = float(pos[0]), float(pos[2])
+        row_c = _IMAGE_CENTER + (world_x - cx) * scale_px
+        col_c = _IMAGE_CENTER + (world_z - cy) * scale_px
+
+        role = str(op.get("objectRole") or "door").lower()
+        pixel_val = 2 if role == "door" else 3
+
+        # Opening footprint: use max(w, d) as square side so a thin door mesh
+        # still produces a clearly visible marker.  Minimum 0.8 m.
+        size = op.get("size")
+        if isinstance(size, (list, tuple)) and len(size) >= 3:
+            side_m = max(float(size[0]), float(size[2]), 0.8)
+        else:
+            side_m = 0.9  # standard door width fallback
+        half_px = max(side_m / 2.0 * scale_px, 1.0)  # at least 1 pixel each side
+
+        r0 = int(max(0, math.floor(row_c - half_px)))
+        r1 = int(min(SLDN_IMAGE_SIZE, math.ceil(row_c + half_px)))
+        c0 = int(max(0, math.floor(col_c - half_px)))
+        c1 = int(min(SLDN_IMAGE_SIZE, math.ceil(col_c + half_px)))
+
+        if r1 > r0 and c1 > c0:
+            img[r0:r1, c0:c1] = pixel_val
 
 
 # ── APM → frontend coordinate inverse transform ───────────────────────────────
