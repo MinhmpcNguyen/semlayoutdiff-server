@@ -91,6 +91,11 @@ _CEILING_CATEGORIES: frozenset[str] = frozenset({
 # assume a good layout covers ~30-50 % of the floor area with furniture.
 _TARGET_COVERAGE_RATIO = 0.40
 
+# Minimum clearance (metres) between furniture centroid and an actual door/window.
+# SLDN has no knowledge of real opening positions, so we post-filter any item
+# whose centroid falls within this radius of a door or window from req.openings.
+_OPENING_CLEARANCE_M = 1.0
+
 
 class PipelineAdapter:
     """
@@ -161,6 +166,25 @@ class PipelineAdapter:
                 furniture = []
             option_furniture_lists.append(furniture)
 
+        # ── Step 3b: Extract real door/window positions from req.openings ────
+        # FrontendOpeningPayload stores extra fields (position, size, …) via
+        # Pydantic's extra="allow" — the frontend sends full SceneObject JSON.
+        # We extract (x, z) world positions so we can clear furniture near them.
+        opening_positions: list[tuple[float, float]] = []
+        for op in req.openings:
+            extra = op.model_extra or {}
+            pos = extra.get("position")
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                opening_positions.append((float(pos[0]), float(pos[2])))
+            elif isinstance(pos, dict):
+                opening_positions.append((float(pos.get("x", 0)), float(pos.get("z", 0))))
+        if opening_positions:
+            logger.info(
+                "Door/window clearance active: %d opening(s) at %s",
+                len(opening_positions),
+                [(round(x, 2), round(z, 2)) for x, z in opening_positions],
+            )
+
         # ── Step 4: Build PipelineNormalizeRunOption objects ─────────────────
         options: list[PipelineNormalizeRunOption] = []
         best_option_id: str | None = None
@@ -169,7 +193,8 @@ class PipelineAdapter:
         for idx, furniture_list in enumerate(option_furniture_lists):
             option_id = f"option_{idx + 1}"
             objects = self._furniture_to_objects(
-                furniture_list, room_center, scale_px, room_polygon_m
+                furniture_list, room_center, scale_px, room_polygon_m,
+                opening_positions=opening_positions or None,
             )
             score = len(objects)  # simple score: more furniture = better layout
             coverage = self._coverage_ratio(furniture_list, polygons, req.source_unit)
@@ -232,10 +257,14 @@ class PipelineAdapter:
         room_center: tuple[float, float],
         scale_px: float,
         room_polygon_m: list[tuple[float, float]],
+        opening_positions: list[tuple[float, float]] | None = None,
     ) -> list[PipelineNormalizeRunObject]:
         objects: list[PipelineNormalizeRunObject] = []
         for item in furniture_list:
-            obj = self._furniture_item_to_object(item, room_center, scale_px, room_polygon_m)
+            obj = self._furniture_item_to_object(
+                item, room_center, scale_px, room_polygon_m,
+                opening_positions=opening_positions,
+            )
             if obj is not None:
                 objects.append(obj)
         return objects
@@ -246,6 +275,7 @@ class PipelineAdapter:
         room_center: tuple[float, float],
         scale_px: float,
         room_polygon_m: list[tuple[float, float]],
+        opening_positions: list[tuple[float, float]] | None = None,
     ) -> PipelineNormalizeRunObject | None:
         category = item.get("category", "unknown")
         pos_apm = item.get("position_apm", {})
@@ -313,6 +343,20 @@ class PipelineAdapter:
                 return None
             world_x = max(lo_x, min(world_x, hi_x))
             world_z = max(lo_z, min(world_z, hi_z))
+
+        # Fix 3 — Door/window clearance: skip furniture whose centroid is within
+        # _OPENING_CLEARANCE_M of any actual door or window position.
+        # SLDN does not receive real opening locations so it may place furniture
+        # in front of actual doors.  We post-filter using req.openings positions.
+        if opening_positions:
+            for ox, oz in opening_positions:
+                dist = ((world_x - ox) ** 2 + (world_z - oz) ** 2) ** 0.5
+                if dist < _OPENING_CLEARANCE_M:
+                    logger.debug(
+                        "Skipping %r at (%.3f, %.3f): within %.2fm of opening at (%.3f, %.3f)",
+                        category, world_x, world_z, dist, ox, oz,
+                    )
+                    return None
 
         model_url = (
             catalog_entry.model_url if catalog_entry else _FALLBACK_MODEL_URL
