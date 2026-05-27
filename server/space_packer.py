@@ -291,6 +291,15 @@ def pack_furniture(
                 hw, hd = float(size.get("w", 1)) / 2, float(size.get("d", 1)) / 2
             else:
                 continue
+            # Apply rotation so the rotated AABB is correctly marked.
+            # rotation_quat is optional; if absent the item is treated as axis-aligned.
+            rot = obj.get("rotation_quat")
+            if isinstance(rot, dict):
+                qy = float(rot.get("y", 0.0))
+                qw = float(rot.get("w", 1.0))
+                angle = 2.0 * math.atan2(qy, qw)
+                cos_a, sin_a = abs(math.cos(angle)), abs(math.sin(angle))
+                hw, hd = hw * cos_a + hd * sin_a, hw * sin_a + hd * cos_a
             grid.mark_occupied(wx, wz, hw, hd, clearance=0.0)  # no extra clearance
 
         sweep_order = _iter_positions(grid, strategy)

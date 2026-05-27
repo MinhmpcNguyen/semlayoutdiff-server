@@ -547,14 +547,36 @@ class PipelineAdapter:
             logger.info("LLM: no catalog entries found for missing types.")
             return options
 
-        # ── Pack items into each option (each uses a different strategy) ──────
-        # Produce packed placements per strategy
-        packed_per_strategy = pack_furniture(
-            polygon_m=room_polygon_m,
-            placed_objects_world=placed_dicts,
-            catalog_items=catalog_items,
-            num_strategies=min(3, len(options)),
-        )
+        # ── Pack items into each option (each uses its OWN base layout) ─────────
+        # Critical: each completed option must pack against the CORRECT base
+        # option's existing furniture, not against a single shared layout.
+        # Using the wrong base causes new items to overlap furniture that exists
+        # in one option but not another (e.g. bed at a different position).
+        num_strategies = min(3, len(options))
+        packed_per_strategy: list[list[dict]] = []
+        for strat_idx in range(num_strategies):
+            base_opt_for_pack = options[strat_idx % len(options)]
+            placed_for_opt = [
+                {
+                    "position": {"x": obj.position.x, "z": obj.position.z},
+                    "size": obj.size or [1.0, 0.5, 1.0],
+                    # Pass quaternion so the packer can compute the rotated AABB.
+                    "rotation_quat": {
+                        "y": obj.rotation.y if obj.rotation else 0.0,
+                        "w": obj.rotation.w if obj.rotation else 1.0,
+                    },
+                }
+                for obj in base_opt_for_pack.objects
+            ]
+            # Run strategies 0..strat_idx and take the last one so each
+            # completed option uses a different sweep order (diversity).
+            results = pack_furniture(
+                polygon_m=room_polygon_m,
+                placed_objects_world=placed_for_opt,
+                catalog_items=catalog_items,
+                num_strategies=strat_idx + 1,
+            )
+            packed_per_strategy.append(results[-1] if results else [])
 
         updated_options: list[PipelineNormalizeRunOption] = list(options)
         base_idx = len(options)
