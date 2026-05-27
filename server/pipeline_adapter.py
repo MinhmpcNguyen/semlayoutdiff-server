@@ -122,13 +122,19 @@ class PipelineAdapter:
         apm_runner: APMRunner,
         catalog_index: CatalogIndex,
         num_options: int = 3,
-        anthropic_api_key: str | None = None,
+        azure_api_key: str | None = None,
+        azure_endpoint: str | None = None,
+        azure_api_version: str | None = None,
+        azure_deployment: str | None = None,
     ) -> None:
         self._sldn = sldn_runner
         self._apm = apm_runner
         self._catalog = catalog_index
         self._num_options = num_options
-        self._anthropic_api_key = anthropic_api_key
+        self._azure_api_key = azure_api_key
+        self._azure_endpoint = azure_endpoint
+        self._azure_api_version = azure_api_version
+        self._azure_deployment = azure_deployment
 
     def run(self, req: PipelineNormalizeRunRequest) -> PipelineNormalizeRunResponse:
         polygons = req.room.polygons
@@ -510,7 +516,10 @@ class PipelineAdapter:
             style=req.style,
             description=req.room.description or req.description,
             special_notes=req.special_notes,
-            api_key=self._anthropic_api_key,
+            azure_api_key=self._azure_api_key,
+            azure_endpoint=self._azure_endpoint,
+            azure_api_version=self._azure_api_version,
+            azure_deployment=self._azure_deployment,
             max_items=8,
         )
 

@@ -17,9 +17,12 @@ METADATA_DIR        Path to preprocess/metadata directory
 JOB_STORAGE_DIR     Directory for job state files
                     (default: <backend_new>/server_jobs)
 NUM_OPTIONS         Number of layout options to generate per request (default: 3)
-SLDN_CONDITION_TYPE "floor", "arch", or "uncon" (default: "arch")
-ANTHROPIC_API_KEY   Anthropic API key for LLM furniture completion (optional;
-                    falls back to rule-based completion when not set)
+SLDN_CONDITION_TYPE          "floor", "arch", or "uncon" (default: "arch")
+AZURE_OPENAI_API_KEY         Azure OpenAI API key (optional; LLM completion
+                             disabled without it)
+AZURE_OPENAI_ENDPOINT        e.g. https://<resource>.openai.azure.com
+AZURE_OPENAI_API_VERSION     e.g. 2024-02-15-preview
+AZURE_OPENAI_CHAT_DEPLOYMENT deployment name (e.g. gpt-4o-mini)
 """
 from __future__ import annotations
 
@@ -88,7 +91,10 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     apm_checkpoint = _env("APM_CHECKPOINT", "")
     num_options = int(_env("NUM_OPTIONS", "3"))
     condition_type = _env("SLDN_CONDITION_TYPE", "arch")
-    anthropic_api_key = _env("ANTHROPIC_API_KEY", "")
+    azure_api_key = _env("AZURE_OPENAI_API_KEY", "")
+    azure_endpoint = _env("AZURE_OPENAI_ENDPOINT", "")
+    azure_api_version = _env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    azure_deployment = _env("AZURE_OPENAI_CHAT_DEPLOYMENT", "") or _env("AZURE_OPENAI_PRIMARY_DEPLOYMENT", "")
 
     # Job manager
     repo = NormalizeRunJobRepository(Path(job_storage_dir))
@@ -130,7 +136,10 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
                 apm_runner=_apm_runner,
                 catalog_index=_catalog_index,
                 num_options=num_options,
-                anthropic_api_key=anthropic_api_key or None,
+                azure_api_key=azure_api_key or None,
+                azure_endpoint=azure_endpoint or None,
+                azure_api_version=azure_api_version or None,
+                azure_deployment=azure_deployment or None,
             )
     else:
         logger.warning(
