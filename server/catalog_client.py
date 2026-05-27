@@ -166,6 +166,40 @@ class CatalogIndex:
             return None
         return entries[0]
 
+    def get_by_type(
+        self,
+        catalog_type: str,
+        max_w_m: float | None = None,
+        max_d_m: float | None = None,
+    ) -> list[CatalogEntry]:
+        """
+        Return catalog entries of the given type, optionally filtered by size.
+
+        Parameters
+        ----------
+        catalog_type : key from ``_KEYWORD_TYPE_MAP`` (e.g. "sofa", "bed")
+        max_w_m : maximum width in metres (dimension index 0 of size_m)
+        max_d_m : maximum depth in metres (dimension index 2 of size_m)
+        """
+        entries = self._by_type.get(catalog_type, [])
+        if max_w_m is None and max_d_m is None:
+            return list(entries)
+        result = []
+        for e in entries:
+            if e.size_m is None:
+                continue
+            w, _h, d = e.size_m
+            if max_w_m is not None and w > max_w_m:
+                continue
+            if max_d_m is not None and d > max_d_m:
+                continue
+            result.append(e)
+        return result
+
+    def available_types(self) -> list[str]:
+        """Return all catalog type keys that have at least one entry."""
+        return [t for t, v in self._by_type.items() if v]
+
     @classmethod
     def empty(cls) -> "CatalogIndex":
         return cls(by_type={})

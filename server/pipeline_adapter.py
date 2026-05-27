@@ -34,7 +34,9 @@ from server.floor_plan_utils import (
     polygon_to_floor_plan_tensor,
     rotation_deg_to_quaternion,
 )
+from server.llm_completer import get_missing_furniture
 from server.ml_runner import APMRunner, SLDNRunner
+from server.space_packer import compute_free_area_m2, pack_furniture
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +122,13 @@ class PipelineAdapter:
         apm_runner: APMRunner,
         catalog_index: CatalogIndex,
         num_options: int = 3,
+        anthropic_api_key: str | None = None,
     ) -> None:
         self._sldn = sldn_runner
         self._apm = apm_runner
         self._catalog = catalog_index
         self._num_options = num_options
+        self._anthropic_api_key = anthropic_api_key
 
     def run(self, req: PipelineNormalizeRunRequest) -> PipelineNormalizeRunResponse:
         polygons = req.room.polygons
@@ -240,7 +244,21 @@ class PipelineAdapter:
                 ],
             )
 
+        # ── Step 4b: LLM furniture completion + space packing ─────────────────
+        try:
+            options = self._complete_and_pack(
+                options=options,
+                room_polygon_m=room_polygon_m,
+                room_type_str=room_type_str,
+                req=req,
+            )
+        except Exception as exc:
+            logger.warning("LLM completion/packing step failed: %s — using APM-only options.", exc)
+
         # ── Step 5: Assemble response ─────────────────────────────────────────
+        # Re-score after packing (more objects = better)
+        best_option_id = max(options, key=lambda o: len(o.objects)).optionId
+
         selected = next(
             (o for o in options if o.optionId == best_option_id), options[0]
         )
@@ -420,3 +438,185 @@ class PipelineAdapter:
             if "size_m" in item
         )
         return min(furniture_area / room_area, 1.0)
+
+    # ── LLM completion + space packing ───────────────────────────────────────
+
+    def _complete_and_pack(
+        self,
+        options: list[PipelineNormalizeRunOption],
+        room_polygon_m: list[tuple[float, float]],
+        room_type_str: str,
+        req: "PipelineNormalizeRunRequest",
+    ) -> list[PipelineNormalizeRunOption]:
+        """
+        1. Collect existing catalog types from all options (union).
+        2. Ask the LLM which catalog types are still missing.
+        3. For each missing type, pick the best-fitting catalog entry
+           (filtered to the remaining free area).
+        4. Pack the selected items into each option using a different
+           placement strategy → one new layout option per strategy that
+           adds items (appended to the existing options list).
+        5. Return the updated (and potentially extended) options list.
+        """
+        import math as _math
+
+        # ── Build reverse map: catalogItemId → catalog_type ──────────────────
+        item_id_to_type: dict[str, str] = {}
+        for cat_type, entries in self._catalog._by_type.items():
+            for e in entries:
+                item_id_to_type[e.catalog_item_id] = cat_type
+
+        # ── Collect existing catalog types from placed objects ────────────────
+        existing_types: set[str] = set()
+        for opt in options:
+            for obj in opt.objects:
+                if obj.catalogItemId and obj.catalogItemId in item_id_to_type:
+                    existing_types.add(item_id_to_type[obj.catalogItemId])
+
+        available_types = self._catalog.available_types()
+        if not available_types:
+            logger.info("Empty catalog — skipping LLM completion step.")
+            return options
+
+        # ── Estimate free area from the best option ──────────────────────────
+        best_opt = max(options, key=lambda o: len(o.objects))
+        placed_dicts = [
+            {
+                "position": {"x": obj.position.x, "z": obj.position.z},
+                "size": obj.size or [1.0, 0.5, 1.0],
+            }
+            for obj in best_opt.objects
+        ]
+        free_area_m2 = compute_free_area_m2(room_polygon_m, placed_dicts)
+        room_area_m2 = abs(
+            sum(
+                room_polygon_m[i][0] * room_polygon_m[(i + 1) % len(room_polygon_m)][1]
+                - room_polygon_m[(i + 1) % len(room_polygon_m)][0] * room_polygon_m[i][1]
+                for i in range(len(room_polygon_m))
+            )
+        ) / 2.0
+
+        logger.info(
+            "LLM completion: room %.1f m², free %.1f m², existing types: %s",
+            room_area_m2, free_area_m2, sorted(existing_types),
+        )
+
+        # ── Ask LLM for missing furniture types ──────────────────────────────
+        missing = get_missing_furniture(
+            room_type=room_type_str,
+            existing_catalog_types=list(existing_types),
+            available_catalog_types=available_types,
+            room_area_m2=room_area_m2,
+            style=req.style,
+            description=req.room.description or req.description,
+            special_notes=req.special_notes,
+            api_key=self._anthropic_api_key,
+            max_items=8,
+        )
+
+        if not missing:
+            logger.info("LLM: no missing furniture identified.")
+            return options
+
+        logger.info(
+            "LLM: %d missing items: %s",
+            len(missing),
+            [(m["type"], m["priority"]) for m in missing],
+        )
+
+        # ── Select catalog entries that fit in remaining space ────────────────
+        # Heuristic: allow items whose footprint ≤ 60 % of free area, max side ≤ sqrt(free/2)
+        max_side = _math.sqrt(max(free_area_m2 / 2.0, 1.0))
+
+        catalog_items: list[tuple[str, CatalogEntry]] = []
+        seen_types: set[str] = set()
+        for m in missing:
+            cat_type = m["type"]
+            if cat_type in seen_types:
+                continue
+            entries = self._catalog.get_by_type(
+                cat_type,
+                max_w_m=max_side,
+                max_d_m=max_side,
+            )
+            if not entries:
+                # Relax size constraint and take first available
+                entries = self._catalog.get_by_type(cat_type)
+            if entries:
+                catalog_items.append((cat_type, entries[0]))
+                seen_types.add(cat_type)
+
+        if not catalog_items:
+            logger.info("LLM: no catalog entries found for missing types.")
+            return options
+
+        # ── Pack items into each option (each uses a different strategy) ──────
+        # Produce packed placements per strategy
+        packed_per_strategy = pack_furniture(
+            polygon_m=room_polygon_m,
+            placed_objects_world=placed_dicts,
+            catalog_items=catalog_items,
+            num_strategies=min(3, len(options)),
+        )
+
+        updated_options: list[PipelineNormalizeRunOption] = list(options)
+        base_idx = len(options)
+
+        for strat_idx, packed_list in enumerate(packed_per_strategy):
+            if not packed_list:
+                continue
+
+            # Build new objects from packed items
+            new_objects: list[PipelineNormalizeRunObject] = []
+            for p in packed_list:
+                entry: CatalogEntry = p["entry"]
+                qx, qy, qz, qw = rotation_deg_to_quaternion(p["rotation_deg"])
+                size = list(entry.size_m) if entry.size_m else [1.0, 0.5, 1.0]
+                new_objects.append(
+                    PipelineNormalizeRunObject(
+                        name=entry.name,
+                        size=size,
+                        type="model",
+                        color=entry.color,
+                        modelUrl=entry.model_url,
+                        position=PipelineNormalizeRunPosition(
+                            x=p["world_x"], y=0.0, z=p["world_z"]
+                        ),
+                        rotation=PipelineNormalizeRunRotation(x=qx, y=qy, z=qz, w=qw),
+                        objectRole=entry.object_role,
+                        catalogItemId=entry.catalog_item_id,
+                        collisionLayer="floor_solid",
+                    )
+                )
+
+            # Append to the corresponding existing option
+            base_opt = options[strat_idx % len(options)]
+            merged_objects = list(base_opt.objects) + new_objects
+            new_opt_id = f"option_{base_idx + strat_idx + 1}"
+            new_opt = PipelineNormalizeRunOption(
+                optionId=new_opt_id,
+                label=f"Layout {base_idx + strat_idx + 1} (completed)",
+                layoutScore=len(merged_objects),
+                hardValid=True,
+                complete=True,
+                coverageRatio=round(
+                    min(
+                        sum(
+                            (obj.size[0] * obj.size[2] if obj.size and len(obj.size) >= 3 else 1.0)
+                            for obj in merged_objects
+                        ) / max(room_area_m2, 1.0),
+                        1.0,
+                    ),
+                    3,
+                ),
+                objects=merged_objects,
+                openings=list(req.openings),
+            )
+            updated_options.append(new_opt)
+
+            logger.info(
+                "Strategy %d: added %d new items → option %s (%d total objects)",
+                strat_idx, len(new_objects), new_opt_id, len(merged_objects),
+            )
+
+        return updated_options

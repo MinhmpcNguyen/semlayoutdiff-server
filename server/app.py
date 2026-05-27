@@ -18,6 +18,8 @@ JOB_STORAGE_DIR     Directory for job state files
                     (default: <backend_new>/server_jobs)
 NUM_OPTIONS         Number of layout options to generate per request (default: 3)
 SLDN_CONDITION_TYPE "floor", "arch", or "uncon" (default: "arch")
+ANTHROPIC_API_KEY   Anthropic API key for LLM furniture completion (optional;
+                    falls back to rule-based completion when not set)
 """
 from __future__ import annotations
 
@@ -86,6 +88,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     apm_checkpoint = _env("APM_CHECKPOINT", "")
     num_options = int(_env("NUM_OPTIONS", "3"))
     condition_type = _env("SLDN_CONDITION_TYPE", "arch")
+    anthropic_api_key = _env("ANTHROPIC_API_KEY", "")
 
     # Job manager
     repo = NormalizeRunJobRepository(Path(job_storage_dir))
@@ -127,6 +130,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
                 apm_runner=_apm_runner,
                 catalog_index=_catalog_index,
                 num_options=num_options,
+                anthropic_api_key=anthropic_api_key or None,
             )
     else:
         logger.warning(
