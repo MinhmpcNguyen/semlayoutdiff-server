@@ -118,6 +118,21 @@ class _Grid:
             and self.cells[ix, iz] == 0
         )
 
+    def _span(
+        self,
+        world_lo: float,
+        world_hi: float,
+        axis_min: float,
+    ) -> tuple[int, int]:
+        """
+        Convert a world-coordinate interval [world_lo, world_hi] to grid index
+        span [i0, i1] (inclusive) using floor for the start and ceil for the end
+        so that every cell that partially overlaps the interval is included.
+        """
+        i0 = int(math.floor((world_lo - axis_min) / self.cell_m))
+        i1 = int(math.ceil((world_hi - axis_min) / self.cell_m)) - 1
+        return i0, i1
+
     def mark_occupied(
         self,
         world_x: float,
@@ -129,8 +144,8 @@ class _Grid:
         """Mark cells covered by an AABB (plus clearance) as occupied."""
         hx = half_w + clearance
         hz = half_d + clearance
-        ix0, iz0 = self.world_to_idx(world_x - hx, world_z - hz)
-        ix1, iz1 = self.world_to_idx(world_x + hx, world_z + hz)
+        ix0, ix1 = self._span(world_x - hx, world_x + hx, self.x_min)
+        iz0, iz1 = self._span(world_z - hz, world_z + hz, self.z_min)
         for ix in range(max(0, ix0), min(self.nx, ix1 + 1)):
             for iz in range(max(0, iz0), min(self.nz, iz1 + 1)):
                 if self.cells[ix, iz] == 0:
@@ -144,8 +159,8 @@ class _Grid:
         half_d: float,
     ) -> bool:
         """Return True if the AABB footprint is entirely on free cells."""
-        ix0, iz0 = self.world_to_idx(world_x - half_w, world_z - half_d)
-        ix1, iz1 = self.world_to_idx(world_x + half_w, world_z + half_d)
+        ix0, ix1 = self._span(world_x - half_w, world_x + half_w, self.x_min)
+        iz0, iz1 = self._span(world_z - half_d, world_z + half_d, self.z_min)
         if ix0 < 0 or iz0 < 0 or ix1 >= self.nx or iz1 >= self.nz:
             return False
         for ix in range(ix0, ix1 + 1):
