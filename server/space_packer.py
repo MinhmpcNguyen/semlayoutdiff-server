@@ -27,12 +27,13 @@ from server.catalog_client import CatalogEntry
 
 logger = logging.getLogger(__name__)
 
-# Grid cell resolution (metres)
-_CELL_M = 0.5
+# Grid cell resolution (metres) — 0.25 m gives enough resolution for small items
+_CELL_M = 0.25
 # Minimum clearance between furniture edge and wall (metres)
-_WALL_CLEARANCE_M = 0.30
-# Minimum clearance between two furniture items (metres)
-_ITEM_CLEARANCE_M = 0.20
+# ceil(0.15 / 0.25) = 1 erosion step = 0.25 m effective clearance
+_WALL_CLEARANCE_M = 0.15
+# Minimum clearance between two newly placed furniture items (metres)
+_ITEM_CLEARANCE_M = 0.15
 
 # Candidate rotations to try for each item (degrees)
 _ROTATIONS = [0.0, 90.0, 180.0, 270.0]
@@ -252,7 +253,10 @@ def pack_furniture(
         # Fresh grid for each strategy
         grid = _Grid(polygon_m, _CELL_M)
 
-        # Mark cells occupied by already-placed items
+        # Mark cells occupied by already-placed items.
+        # Use clearance=0.0 so only the item's actual footprint is blocked —
+        # applying extra clearance here was causing the bed to consume nearly
+        # all available grid cells, leaving no space for new items.
         for obj in placed_objects_world:
             pos = obj.get("position")
             size = obj.get("size")
@@ -272,7 +276,7 @@ def pack_furniture(
                 hw, hd = float(size.get("w", 1)) / 2, float(size.get("d", 1)) / 2
             else:
                 continue
-            grid.mark_occupied(wx, wz, hw, hd)
+            grid.mark_occupied(wx, wz, hw, hd, clearance=0.0)  # no extra clearance
 
         sweep_order = _iter_positions(grid, strategy)
         placed: list[dict] = []
