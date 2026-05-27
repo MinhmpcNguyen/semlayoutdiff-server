@@ -1,29 +1,92 @@
 """
 LLM-based furniture completeness checker using Azure OpenAI.
 
-Given the current furniture list and room context (type, style, description,
-special notes, area), asks the LLM which furniture types are still missing
-and in what priority order.  Falls back to a simple rule-based list when
-Azure credentials are not set or the API call fails.
+API key resolution (mirrors backend/config/openai_config.py):
+  1. AZURE_OPENAI_API_KEY env var (plaintext)
+  2. OPENAI_PUBLIC_KEY  (Fernet key)  +  OPENAI_PRIVATE_KEY_FILE  (path to
+     the encrypted .enc file) → Fernet.decrypt(file) → plaintext key
+  3. OPENAI_API_KEY env var (plaintext fallback)
 
-Environment variables (same as backend/config/openai_config.py):
-  AZURE_OPENAI_API_KEY      Azure OpenAI API key
-  AZURE_OPENAI_ENDPOINT     e.g. https://<resource>.openai.azure.com
-  AZURE_OPENAI_API_VERSION  e.g. 2024-02-15-preview  (default: 2024-02-15-preview)
-  AZURE_OPENAI_CHAT_DEPLOYMENT  deployment name (e.g. gpt-4o-mini)
+Other env vars:
+  AZURE_OPENAI_ENDPOINT          e.g. https://<resource>.services.ai.azure.com/...
+                                  (path portion is stripped automatically)
+  AZURE_OPENAI_API_VERSION       default: 2024-12-01-preview
+  AZURE_OPENAI_CHAT_DEPLOYMENT   deployment name  (e.g. gpt-5.4-mini-furniture)
+  AZURE_OPENAI_PRIMARY_DEPLOYMENT  alias for the above
+  OPENAI_API_VERSION             fallback for api version
 
-Return value is a list of dicts:
+Return value:
     [{"type": str, "priority": int, "reason": str}, ...]
-where ``type`` is a catalog type key, ``priority`` is 1 (highest) … N.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Directory of this file — used to resolve relative private_key paths
+_SERVER_DIR = Path(__file__).parent.resolve()
+_BACKEND_NEW_ROOT = _SERVER_DIR.parent
+
+_DEFAULT_API_VERSION = "2024-12-01-preview"
+
+# ── Fernet key decryption (same logic as openai_config.py) ───────────────────
+
+def _resolve_api_key() -> str | None:
+    """
+    Resolve the Azure OpenAI API key using the same three-step logic as
+    the original backend's OpenAIAccess.get_openai_access().
+    """
+    def _env(*names: str) -> str | None:
+        for n in names:
+            v = os.getenv(n, "").strip()
+            if v and not (v.startswith("${") and v.endswith("}")):
+                return v
+        return None
+
+    # 1. Direct plaintext env vars
+    key = _env("AZURE_OPENAI_API_KEY", "OPENAI_API_KEY")
+    if key:
+        return key
+
+    # 2. Fernet-encrypted file
+    public_key = _env("OPENAI_PUBLIC_KEY")
+    key_file = _env("OPENAI_PRIVATE_KEY_FILE")
+    if public_key and key_file:
+        try:
+            from cryptography.fernet import Fernet
+            # Resolve path: if relative, look next to this file then backend_new root
+            p = Path(key_file)
+            if not p.is_absolute():
+                candidates = [
+                    _BACKEND_NEW_ROOT / p,
+                    _SERVER_DIR / p,
+                    Path.cwd() / p,
+                ]
+                for c in candidates:
+                    if c.exists():
+                        p = c
+                        break
+            encrypted = p.read_bytes()
+            return Fernet(public_key.encode()).decrypt(encrypted).decode()
+        except Exception as exc:
+            logger.warning("Fernet key decryption failed: %s", exc)
+
+    return None
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    """Strip path/query from Azure endpoint URL (same as openai_client._normalize_azure_endpoint)."""
+    parsed = urlparse(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid Azure endpoint: {endpoint!r}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
 
 # ── Rule-based fallbacks ──────────────────────────────────────────────────────
 
@@ -60,9 +123,7 @@ def _rule_based(
     return missing[:max_items]
 
 
-# ── Azure OpenAI path ─────────────────────────────────────────────────────────
-
-_DEFAULT_API_VERSION = "2024-02-15-preview"
+# ── Azure OpenAI call ─────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """You are an interior design assistant checking whether a furniture layout is complete.
 
@@ -132,19 +193,16 @@ def _llm_missing(
         response_format={"type": "json_object"},
     )
 
-    raw = resp.choices[0].message.content or ""
-    raw = raw.strip()
+    raw = (resp.choices[0].message.content or "").strip()
 
-    # Azure json_object mode wraps in {"items": [...]} sometimes — handle both
     data = json.loads(raw)
+    # Azure json_object mode sometimes wraps in {"items": [...]}
     if isinstance(data, dict):
-        # Try common wrapper keys
         for key in ("items", "furniture", "missing", "result", "list"):
             if isinstance(data.get(key), list):
                 data = data[key]
                 break
         else:
-            # Fallback: flatten dict values if they are dicts
             data = list(data.values()) if all(isinstance(v, dict) for v in data.values()) else []
 
     if not isinstance(data, list):
@@ -172,6 +230,7 @@ def get_missing_furniture(
     style: str | None = None,
     description: str | None = None,
     special_notes: str | None = None,
+    # Optional overrides — fall back to env vars when None
     azure_api_key: str | None = None,
     azure_endpoint: str | None = None,
     azure_api_version: str | None = None,
@@ -181,35 +240,52 @@ def get_missing_furniture(
     """
     Return a prioritised list of missing furniture types.
 
-    Credentials fall back to environment variables if not provided:
-      AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
-      AZURE_OPENAI_API_VERSION, AZURE_OPENAI_CHAT_DEPLOYMENT
+    API key is resolved (in order):
+      1. ``azure_api_key`` argument
+      2. AZURE_OPENAI_API_KEY / OPENAI_API_KEY env vars
+      3. Fernet decrypt: OPENAI_PUBLIC_KEY + OPENAI_PRIVATE_KEY_FILE
+
+    Endpoint / deployment fall back to env vars:
+      AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_CHAT_DEPLOYMENT (or PRIMARY),
+      AZURE_OPENAI_API_VERSION / OPENAI_API_VERSION
     """
     existing_set = set(existing_catalog_types)
     available_set = set(available_catalog_types) - existing_set
-
     if not available_set:
         return []
 
-    key = azure_api_key or os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    def _env(*names: str) -> str | None:
+        for n in names:
+            v = os.getenv(n, "").strip()
+            if v and not (v.startswith("${") and v.endswith("}")):
+                return v
+        return None
+
+    key = azure_api_key or _resolve_api_key()
+    endpoint_raw = azure_endpoint or _env("AZURE_OPENAI_ENDPOINT") or ""
     api_version = (
         azure_api_version
-        or os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+        or _env("AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION")
         or _DEFAULT_API_VERSION
     )
     deployment = (
         azure_deployment
-        or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip()
-        or os.getenv("AZURE_OPENAI_PRIMARY_DEPLOYMENT", "").strip()
+        or _env("AZURE_OPENAI_CHAT_DEPLOYMENT", "AZURE_OPENAI_PRIMARY_DEPLOYMENT")
+        or ""
     )
 
-    if not key or not endpoint or not deployment:
+    if not key or not endpoint_raw or not deployment:
         logger.info(
-            "Azure OpenAI credentials incomplete (key=%s, endpoint=%s, deployment=%s) "
-            "— using rule-based furniture completion.",
-            bool(key), bool(endpoint), bool(deployment),
+            "Azure OpenAI config incomplete (key=%s endpoint=%s deployment=%s) "
+            "— using rule-based completion.",
+            bool(key), bool(endpoint_raw), bool(deployment),
         )
+        return _rule_based(room_type, existing_set, available_set, max_items)
+
+    try:
+        endpoint = _normalize_endpoint(endpoint_raw)
+    except ValueError as exc:
+        logger.warning("Bad Azure endpoint %r: %s — rule-based fallback.", endpoint_raw, exc)
         return _rule_based(room_type, existing_set, available_set, max_items)
 
     try:
@@ -228,5 +304,5 @@ def get_missing_furniture(
             max_items=max_items,
         )
     except Exception as exc:
-        logger.warning("Azure OpenAI furniture completion failed (%s) — falling back to rules.", exc)
+        logger.warning("Azure OpenAI call failed (%s) — rule-based fallback.", exc)
         return _rule_based(room_type, existing_set, available_set, max_items)

@@ -17,12 +17,16 @@ METADATA_DIR        Path to preprocess/metadata directory
 JOB_STORAGE_DIR     Directory for job state files
                     (default: <backend_new>/server_jobs)
 NUM_OPTIONS         Number of layout options to generate per request (default: 3)
-SLDN_CONDITION_TYPE          "floor", "arch", or "uncon" (default: "arch")
-AZURE_OPENAI_API_KEY         Azure OpenAI API key (optional; LLM completion
-                             disabled without it)
-AZURE_OPENAI_ENDPOINT        e.g. https://<resource>.openai.azure.com
-AZURE_OPENAI_API_VERSION     e.g. 2024-02-15-preview
-AZURE_OPENAI_CHAT_DEPLOYMENT deployment name (e.g. gpt-4o-mini)
+SLDN_CONDITION_TYPE              "floor", "arch", or "uncon" (default: "arch")
+
+Azure OpenAI (for LLM furniture completion) — optional, falls back to
+rule-based when not set.  Same env vars as the original backend:
+  AZURE_OPENAI_API_KEY           plaintext key  (or use Fernet decrypt below)
+  AZURE_OPENAI_ENDPOINT          e.g. https://<resource>.services.ai.azure.com/...
+  AZURE_OPENAI_API_VERSION       default: 2024-12-01-preview
+  AZURE_OPENAI_CHAT_DEPLOYMENT   deployment name (e.g. gpt-5.4-mini-furniture)
+  OPENAI_PUBLIC_KEY              Fernet symmetric key (alternative to plaintext)
+  OPENAI_PRIVATE_KEY_FILE        path to encrypted key file (e.g. private_key.enc)
 """
 from __future__ import annotations
 
@@ -91,10 +95,20 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     apm_checkpoint = _env("APM_CHECKPOINT", "")
     num_options = int(_env("NUM_OPTIONS", "3"))
     condition_type = _env("SLDN_CONDITION_TYPE", "arch")
-    azure_api_key = _env("AZURE_OPENAI_API_KEY", "")
-    azure_endpoint = _env("AZURE_OPENAI_ENDPOINT", "")
-    azure_api_version = _env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-    azure_deployment = _env("AZURE_OPENAI_CHAT_DEPLOYMENT", "") or _env("AZURE_OPENAI_PRIMARY_DEPLOYMENT", "")
+    # Azure OpenAI credentials are read directly from env vars by llm_completer.
+    # Just log whether they appear to be configured.
+    _has_key = bool(
+        _env("AZURE_OPENAI_API_KEY", "") or _env("OPENAI_API_KEY", "") or _env("OPENAI_PUBLIC_KEY", "")
+    )
+    _has_endpoint = bool(_env("AZURE_OPENAI_ENDPOINT", ""))
+    _has_deployment = bool(
+        _env("AZURE_OPENAI_CHAT_DEPLOYMENT", "") or _env("AZURE_OPENAI_PRIMARY_DEPLOYMENT", "")
+    )
+    _llm_ready = _has_key and _has_endpoint and _has_deployment
+    logger.info(
+        "LLM furniture completion: %s",
+        "enabled" if _llm_ready else "disabled (rule-based fallback)",
+    )
 
     # Job manager
     repo = NormalizeRunJobRepository(Path(job_storage_dir))
@@ -136,10 +150,6 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
                 apm_runner=_apm_runner,
                 catalog_index=_catalog_index,
                 num_options=num_options,
-                azure_api_key=azure_api_key or None,
-                azure_endpoint=azure_endpoint or None,
-                azure_api_version=azure_api_version or None,
-                azure_deployment=azure_deployment or None,
             )
     else:
         logger.warning(
