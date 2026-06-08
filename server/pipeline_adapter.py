@@ -28,11 +28,15 @@ from server.domain import (
     PipelineNormalizeRunRotation,
 )
 from server.floor_plan_utils import (
+    ROOM_TYPE_DININGROOM,
+    ROOM_TYPE_LIVINGROOM,
     _to_meters,
     apm_position_to_world,
     detect_room_type,
+    is_combined_living_kitchen,
     polygon_to_floor_plan_tensor,
     rotation_deg_to_quaternion,
+    split_polygon_60_40,
 )
 from server.llm_completer import get_missing_furniture
 from server.ml_runner import APMRunner, SLDNRunner
@@ -132,6 +136,11 @@ class PipelineAdapter:
         polygons = req.room.polygons
         if not polygons or len(polygons) < 3:
             raise ValueError("Room polygon must have at least 3 vertices.")
+
+        # ── Combined living+kitchen rooms: separate pipeline ──────────────────
+        if is_combined_living_kitchen(req.room.name, req.room.description):
+            logger.info("Detected combined living+kitchen room — running split pipeline.")
+            return self._run_combined_living_kitchen(req)
 
         # ── Step 1: Convert polygon → floor plan tensor ───────────────────────
         # Build opening dicts for arch encoding (door=2, window=3 pixels).
@@ -639,3 +648,259 @@ class PipelineAdapter:
             )
 
         return updated_options
+
+    # ── Combined living + kitchen pipeline ────────────────────────────────────
+
+    def _run_combined_living_kitchen(
+        self,
+        req: "PipelineNormalizeRunRequest",
+    ) -> "PipelineNormalizeRunResponse":
+        """
+        Handle a combined living-room + kitchen space.
+
+        1. Split the room polygon 60/40 along the longer axis.
+        2. The sub-polygon with more door/window openings → living room.
+        3. SLDN(livingroom) + APM for the living sub-polygon.
+        4. SLDN(diningroom) + APM for the kitchen sub-polygon.
+        5. Pair the results into N combined options.
+        6. Run LLM completion separately for each sub-room and merge extras.
+        """
+        import math as _math
+
+        polygons = req.room.polygons
+        room_polygon_m = _to_meters(polygons, req.source_unit)
+
+        # ── Extract openings ──────────────────────────────────────────────────
+        opening_dicts: list[dict] = []
+        for op in req.openings:
+            d: dict = {"objectRole": op.objectRole}
+            if op.model_extra:
+                d.update(op.model_extra)
+            opening_dicts.append(d)
+
+        opening_positions: list[tuple[float, float]] = []
+        for op in req.openings:
+            extra = op.model_extra or {}
+            pos = extra.get("position")
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                opening_positions.append((float(pos[0]), float(pos[2])))
+            elif isinstance(pos, dict):
+                opening_positions.append((float(pos.get("x", 0)), float(pos.get("z", 0))))
+
+        # ── Split 60/40 ───────────────────────────────────────────────────────
+        poly_living, poly_kitchen = split_polygon_60_40(room_polygon_m, opening_positions)
+
+        if len(poly_living) < 3 or len(poly_kitchen) < 3:
+            logger.warning(
+                "Combined-room polygon split produced a degenerate sub-polygon "
+                "— treating the whole room as a living room."
+            )
+            poly_living, poly_kitchen = room_polygon_m, room_polygon_m
+
+        logger.info(
+            "Combined split: living %d pts, kitchen %d pts, %d openings",
+            len(poly_living), len(poly_kitchen), len(opening_positions),
+        )
+
+        # ── Filter openings per sub-polygon ───────────────────────────────────
+        def _filter_dicts(sub_poly: list[tuple[float, float]]) -> list[dict]:
+            result = []
+            for d in opening_dicts:
+                pos = d.get("position")
+                if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                    ox, oz = float(pos[0]), float(pos[2])
+                elif isinstance(pos, dict):
+                    ox, oz = float(pos.get("x", 0)), float(pos.get("z", 0))
+                else:
+                    continue
+                if _point_in_polygon(ox, oz, sub_poly):
+                    result.append(d)
+            return result
+
+        def _filter_positions(sub_poly: list[tuple[float, float]]) -> list[tuple[float, float]]:
+            return [(ox, oz) for ox, oz in opening_positions if _point_in_polygon(ox, oz, sub_poly)]
+
+        od_living = _filter_dicts(poly_living)
+        od_kitchen = _filter_dicts(poly_kitchen)
+        op_living = _filter_positions(poly_living)
+        op_kitchen = _filter_positions(poly_kitchen)
+
+        # ── Floor plan tensors ────────────────────────────────────────────────
+        fp_living, ctr_living, scl_living = polygon_to_floor_plan_tensor(
+            poly_living, "m", od_living or None
+        )
+        fp_kitchen, ctr_kitchen, scl_kitchen = polygon_to_floor_plan_tensor(
+            poly_kitchen, "m", od_kitchen or None
+        )
+
+        # ── SLDN inference ────────────────────────────────────────────────────
+        try:
+            sem_living = self._sldn.generate(
+                fp_living, ROOM_TYPE_LIVINGROOM, num_samples=self._num_options
+            )
+        except Exception as exc:
+            raise RuntimeError(f"SLDN (living room) failed: {exc}") from exc
+
+        try:
+            sem_kitchen = self._sldn.generate(
+                fp_kitchen, ROOM_TYPE_DININGROOM, num_samples=self._num_options
+            )
+        except Exception as exc:
+            raise RuntimeError(f"SLDN (kitchen/dining) failed: {exc}") from exc
+
+        # ── APM → objects per sub-room ────────────────────────────────────────
+        living_objs: list[list[PipelineNormalizeRunObject]] = []
+        for sem in sem_living:
+            try:
+                furn = self._apm.predict(sem)
+            except Exception:
+                furn = []
+            living_objs.append(
+                self._furniture_to_objects(furn, ctr_living, scl_living, poly_living,
+                                           opening_positions=op_living or None)
+            )
+
+        kitchen_objs: list[list[PipelineNormalizeRunObject]] = []
+        for sem in sem_kitchen:
+            try:
+                furn = self._apm.predict(sem)
+            except Exception:
+                furn = []
+            kitchen_objs.append(
+                self._furniture_to_objects(furn, ctr_kitchen, scl_kitchen, poly_kitchen,
+                                           opening_positions=op_kitchen or None)
+            )
+
+        # ── Room area (full polygon) ──────────────────────────────────────────
+        room_area_m2 = abs(
+            sum(
+                room_polygon_m[i][0] * room_polygon_m[(i + 1) % len(room_polygon_m)][1]
+                - room_polygon_m[(i + 1) % len(room_polygon_m)][0] * room_polygon_m[i][1]
+                for i in range(len(room_polygon_m))
+            )
+        ) / 2.0
+
+        # ── Combine into paired options ───────────────────────────────────────
+        n = self._num_options
+        options: list[PipelineNormalizeRunOption] = []
+        for idx in range(n):
+            combined = living_objs[idx] + kitchen_objs[idx]
+            options.append(PipelineNormalizeRunOption(
+                optionId=f"option_{idx + 1}",
+                label=f"Layout {idx + 1}",
+                layoutScore=len(combined),
+                hardValid=len(combined) > 0,
+                complete=len(combined) > 0,
+                coverageRatio=round(
+                    min(
+                        sum(
+                            (o.size[0] * o.size[2] if o.size and len(o.size) >= 3 else 1.0)
+                            for o in combined
+                        ) / max(room_area_m2, 1.0),
+                        1.0,
+                    ),
+                    3,
+                ),
+                objects=combined,
+                openings=list(req.openings),
+            ))
+
+        if not options:
+            return PipelineNormalizeRunResponse(
+                objects=[], openings=list(req.openings),
+                selectedOptionId=None, options=[],
+                debugZones=[
+                    PipelineNormalizeRunDebugZone(roomId="living_1", roomType="livingroom",
+                                                  polygon=list(poly_living)),
+                    PipelineNormalizeRunDebugZone(roomId="kitchen_1", roomType="kitchen",
+                                                  polygon=list(poly_kitchen)),
+                ],
+            )
+
+        # ── LLM completion per sub-room ───────────────────────────────────────
+        # Build single-sub-room stub lists so _complete_and_pack sees only the
+        # relevant objects and the correct sub-polygon.
+        living_stubs = [
+            PipelineNormalizeRunOption(
+                optionId=f"l_{i + 1}", label=f"Living {i + 1}",
+                layoutScore=len(objs), hardValid=True, complete=True, coverageRatio=0.0,
+                objects=objs, openings=list(req.openings),
+            )
+            for i, objs in enumerate(living_objs)
+        ]
+        kitchen_stubs = [
+            PipelineNormalizeRunOption(
+                optionId=f"k_{i + 1}", label=f"Kitchen {i + 1}",
+                layoutScore=len(objs), hardValid=True, complete=True, coverageRatio=0.0,
+                objects=objs, openings=list(req.openings),
+            )
+            for i, objs in enumerate(kitchen_objs)
+        ]
+
+        try:
+            done_living = self._complete_and_pack(living_stubs, poly_living, "livingroom", req)
+        except Exception as exc:
+            logger.warning("Living room completion failed: %s", exc)
+            done_living = living_stubs
+
+        try:
+            done_kitchen = self._complete_and_pack(kitchen_stubs, poly_kitchen, "kitchen", req)
+        except Exception as exc:
+            logger.warning("Kitchen completion failed: %s", exc)
+            done_kitchen = kitchen_stubs
+
+        # ── Merge extras into combined options ────────────────────────────────
+        # done_living[0..n-1] = original stubs (unchanged)
+        # done_living[n..]    = new "completed" options with extra packed items
+        living_extras = done_living[n:]
+        kitchen_extras = done_kitchen[n:]
+        num_extras = min(len(living_extras), len(kitchen_extras))
+
+        merged_options: list[PipelineNormalizeRunOption] = list(options)
+        for strat_idx in range(num_extras):
+            base_opt = options[strat_idx % n]
+            # Extra items are appended AFTER the stub base objects
+            base_l = len(living_stubs[strat_idx % n].objects)
+            base_k = len(kitchen_stubs[strat_idx % n].objects)
+            extra_live = living_extras[strat_idx].objects[base_l:]
+            extra_kit = kitchen_extras[strat_idx].objects[base_k:]
+            merged = list(base_opt.objects) + extra_live + extra_kit
+            merged_options.append(PipelineNormalizeRunOption(
+                optionId=f"option_{n + strat_idx + 1}",
+                label=f"Layout {n + strat_idx + 1} (completed)",
+                layoutScore=len(merged),
+                hardValid=True,
+                complete=True,
+                coverageRatio=round(
+                    min(
+                        sum(
+                            (o.size[0] * o.size[2] if o.size and len(o.size) >= 3 else 1.0)
+                            for o in merged
+                        ) / max(room_area_m2, 1.0),
+                        1.0,
+                    ),
+                    3,
+                ),
+                objects=merged,
+                openings=list(req.openings),
+            ))
+
+        best_id = max(merged_options, key=lambda o: len(o.objects)).optionId
+        selected = next((o for o in merged_options if o.optionId == best_id), merged_options[0])
+
+        return PipelineNormalizeRunResponse(
+            objects=selected.objects,
+            openings=list(req.openings),
+            selectedOptionId=best_id,
+            options=merged_options,
+            debugZones=[
+                PipelineNormalizeRunDebugZone(
+                    roomId="living_1", roomType="livingroom",
+                    polygon=list(poly_living),
+                ),
+                PipelineNormalizeRunDebugZone(
+                    roomId="kitchen_1", roomType="kitchen",
+                    polygon=list(poly_kitchen),
+                ),
+            ],
+        )

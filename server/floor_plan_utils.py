@@ -75,6 +75,116 @@ def detect_room_type(name: str | None, description: str | None) -> int:
     return ROOM_TYPE_LIVINGROOM
 
 
+def is_combined_living_kitchen(name: str | None, description: str | None) -> bool:
+    """
+    Return True if the room name/description suggests a combined living+kitchen
+    space (e.g. "Phòng khách + Ăn + Bếp").
+    """
+    text = " ".join(filter(None, [name, description])).lower()
+    has_living = any(kw in text for kw in _LIVINGROOM_KEYWORDS)
+    has_kitchen = any(kw in text for kw in _DININGROOM_KEYWORDS)
+    return has_living and has_kitchen
+
+
+# ── Polygon splitting (combined room) ─────────────────────────────────────────
+
+def _clip_polygon_halfplane(
+    polygon: list[tuple[float, float]],
+    axis: int,
+    threshold: float,
+    keep_lo: bool,
+) -> list[tuple[float, float]]:
+    """
+    Sutherland-Hodgman clip of *polygon* by an axis-aligned half-plane.
+
+    Parameters
+    ----------
+    axis      : 0 = clip along X, 1 = clip along Z
+    threshold : the split coordinate value
+    keep_lo   : True → keep the side where coord ≤ threshold
+    """
+    if len(polygon) < 2:
+        return []
+    result: list[tuple[float, float]] = []
+    n = len(polygon)
+    for i in range(n):
+        curr = polygon[i]
+        nxt = polygon[(i + 1) % n]
+        cv, nv = curr[axis], nxt[axis]
+        c_in = (cv <= threshold) if keep_lo else (cv >= threshold)
+        n_in = (nv <= threshold) if keep_lo else (nv >= threshold)
+        if c_in:
+            result.append(curr)
+        if c_in != n_in:
+            dv = nv - cv
+            if abs(dv) < 1e-12:
+                continue
+            t = (threshold - cv) / dv
+            other = 1 - axis
+            iv = curr[other] + t * (nxt[other] - curr[other])
+            result.append((threshold, iv) if axis == 0 else (iv, threshold))
+    return result
+
+
+def _point_in_polygon_m(x: float, z: float, polygon: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon test (metres)."""
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, zi = polygon[i]
+        xj, zj = polygon[j]
+        if ((zi > z) != (zj > z)) and (x < (xj - xi) * (z - zi) / (zj - zi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def split_polygon_60_40(
+    polygon_m: list[tuple[float, float]],
+    opening_positions_m: list[tuple[float, float]],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """
+    Split *polygon_m* into two sub-polygons with approximately 60/40 area ratio.
+
+    The cut is made along the **longer** bounding-box axis at the 60 % mark.
+    The sub-polygon that contains **more** door/window openings is returned
+    first and designated as the **living room**; the other becomes the kitchen.
+
+    Parameters
+    ----------
+    polygon_m : room polygon vertices in metres  [(x, z), ...]
+    opening_positions_m : door/window (x, z) world positions in metres
+
+    Returns
+    -------
+    (poly_living, poly_kitchen)  — each a list of (x, z) metre tuples
+    """
+    xs = [p[0] for p in polygon_m]
+    zs = [p[1] for p in polygon_m]
+    x_range = max(xs) - min(xs)
+    z_range = max(zs) - min(zs)
+
+    if x_range >= z_range:
+        axis, threshold = 0, min(xs) + x_range * 0.6
+    else:
+        axis, threshold = 1, min(zs) + z_range * 0.6
+
+    poly_lo = _clip_polygon_halfplane(polygon_m, axis, threshold, keep_lo=True)
+    poly_hi = _clip_polygon_halfplane(polygon_m, axis, threshold, keep_lo=False)
+
+    def _count_in(poly: list[tuple[float, float]]) -> int:
+        if len(poly) < 3:
+            return 0
+        return sum(1 for ox, oz in opening_positions_m if _point_in_polygon_m(ox, oz, poly))
+
+    # The sub-polygon with more doors is the living room
+    if _count_in(poly_lo) >= _count_in(poly_hi):
+        return poly_lo, poly_hi
+    else:
+        return poly_hi, poly_lo
+
+
 # ── Floor plan rasterization ──────────────────────────────────────────────────
 
 def polygon_to_floor_plan_tensor(

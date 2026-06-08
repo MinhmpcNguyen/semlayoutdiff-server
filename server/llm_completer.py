@@ -94,6 +94,8 @@ _ROOM_DEFAULTS: dict[str, list[str]] = {
     "bedroom": ["bed", "nightstand", "wardrobe", "desk", "chair"],
     "livingroom": ["sofa", "coffee_table", "tv_console", "armchair", "bookshelf"],
     "diningroom": ["dining_table", "chair", "cabinet", "bookshelf"],
+    # kitchen: LLM fills fridge / sink / cabinets; dining table comes from SLDN
+    "kitchen": ["fridge", "sink", "kitchen_cabinet", "microwave", "stove"],
 }
 
 _FALLBACK_PRIORITIES: dict[str, int] = {
@@ -101,6 +103,8 @@ _FALLBACK_PRIORITIES: dict[str, int] = {
     "sofa": 1, "tv_console": 2, "coffee_table": 3, "armchair": 4,
     "dining_table": 1,
     "chair": 3, "bookshelf": 5, "cabinet": 6, "ceiling_light": 7,
+    # kitchen priorities
+    "fridge": 1, "sink": 2, "kitchen_cabinet": 3, "stove": 4, "microwave": 5,
 }
 
 
